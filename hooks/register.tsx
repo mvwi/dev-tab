@@ -87,14 +87,38 @@ end tell
 return "none"`
 }
 
-async function refreshPorts($: EngineInterface, root: string, worktrees: string[]) {
+async function refreshPorts($: EngineInterface, root: string, cwd: string) {
   const listen = await $.process.run(['lsof', '-nP', '-iTCP', '-sTCP:LISTEN', '-Fpcn'])
   const pids = [...parseListeners(listen.stdout).keys()]
   // lsof exits 1 when a pid vanished between calls; its output still holds the rest.
-  const cwd = pids.length ? (await $.process.run(['lsof', '-a', '-p', pids.join(','), '-d', 'cwd', '-Fpn'])).stdout : ''
-  const next = ownedPorts(listen.stdout, cwd, worktrees, root)
+  const cwds = pids.length ? (await $.process.run(['lsof', '-a', '-p', pids.join(','), '-d', 'cwd', '-Fpn'])).stdout : ''
+  // Read each tick so a worktree made mid-session keeps its own servers.
+  const list = await $.process.run(['git', 'worktree', 'list', '--porcelain'], { cwd })
+  const worktrees = list.stdout.split('\n').filter(l => l.startsWith('worktree ')).map(l => l.slice(9))
+  if (!worktrees.includes(root)) worktrees.push(root)
+  const next = ownedPorts(listen.stdout, cwds, worktrees, root)
   const prev = await read($, ports)
   if (next.join() !== prev.join()) await update($, ports, () => next)
+}
+
+// Which of BROWSERS is installed, and which one handles https links.
+// shortcut: looks in /Applications and ~/Applications only, add a dir if someone keeps browsers elsewhere
+async function findBrowsers($: EngineInterface) {
+  const home = await $.env.get('HOME')
+  const found: string[] = []
+  for (const [id, { app }] of Object.entries(BROWSERS)) {
+    for (const dir of ['/Applications', `${home}/Applications`]) {
+      const isDir = await $.fs.stat(`${dir}/${app}.app`).then(st => st.kind === 'dir', () => false)
+      if (isDir) { found.push(id); break }
+    }
+  }
+  await update($, installed, () => found)
+
+  const handlers = await $.process.run(['plutil', '-extract', 'LSHandlers', 'json', '-o', '-', `${home}/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist`])
+  if (handlers.exitCode !== 0) return
+  const https = (JSON.parse(handlers.stdout) as { LSHandlerURLScheme?: string; LSHandlerRoleAll?: string }[])
+    .find(h => h.LSHandlerURLScheme === 'https')
+  await update($, defaultId, () => https?.LSHandlerRoleAll?.toLowerCase() ?? '')
 }
 
 export const register: Register = on => {
@@ -109,27 +133,14 @@ export const register: Register = on => {
 
     const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd: e.cwd })
     const root = top.exitCode === 0 ? top.stdout.trim() : e.cwd
-    const list = await $.process.run(['git', 'worktree', 'list', '--porcelain'], { cwd: e.cwd })
-    const worktrees = list.stdout.split('\n').filter(l => l.startsWith('worktree ')).map(l => l.slice(9))
-    if (!worktrees.includes(root)) worktrees.push(root)
 
     const saved = await $.store.get('browser')
     if (typeof saved === 'string') await update($, browser, () => saved)
 
-    const handlers = await $.process.run(['plutil', '-extract', 'LSHandlers', 'json', '-o', '-', `${await $.env.get('HOME')}/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist`])
-    if (handlers.exitCode === 0) {
-      const https = (JSON.parse(handlers.stdout) as { LSHandlerURLScheme?: string; LSHandlerRoleAll?: string }[])
-        .find(h => h.LSHandlerURLScheme === 'https')
-      await update($, defaultId, () => https?.LSHandlerRoleAll?.toLowerCase() ?? '')
-    }
-
-    const query = Object.keys(BROWSERS).map(id => `kMDItemCFBundleIdentifier ==[c] "${id}"`).join(' || ')
-    const found = await $.process.run(['mdfind', query])
-    const names = found.stdout.split('\n').map(p => p.split('/').pop()?.replace(/\.app$/, ''))
-    await update($, installed, () => Object.keys(BROWSERS).filter(id => names.includes(BROWSERS[id]!.app)))
-
-    await refreshPorts($, root, worktrees)
-    $.clock.every(5000, () => refreshPorts($, root, worktrees))
+    // Neither is awaited: the first prompt should not wait on lsof or the disk.
+    findBrowsers($).catch(err => $.ui.toast(`dev-tab: ${String(err)}`))
+    void refreshPorts($, root, e.cwd)
+    $.clock.every(5000, () => void refreshPorts($, root, e.cwd))
 
     return started
   })
