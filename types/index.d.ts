@@ -9,5 +9,3 @@ declare module 'claude-code' {
     }
   }
 }
-
-export type Port = number

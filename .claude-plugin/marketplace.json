@@ -1,5 +1,6 @@
 {
   "name": "dev-tab",
+  "description": "A band above the prompt with a button for each dev server running from this worktree",
   "owner": { "name": "Michael Williams" },
   "plugins": [{ "name": "dev-tab", "source": "./" }]
 }

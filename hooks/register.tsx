@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { Engine, Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
 type Kind = 'chromium' | 'safari' | 'arc' | 'other'
 
@@ -87,7 +87,7 @@ end tell
 return "none"`
 }
 
-async function refreshPorts($: Engine, root: string, worktrees: string[]) {
+async function refreshPorts($: EngineInterface, root: string, worktrees: string[]) {
   const listen = await $.process.run(['lsof', '-nP', '-iTCP', '-sTCP:LISTEN', '-Fpcn'])
   const pids = [...parseListeners(listen.stdout).keys()]
   // lsof exits 1 when a pid vanished between calls; its output still holds the rest.
@@ -100,6 +100,12 @@ async function refreshPorts($: Engine, root: string, worktrees: string[]) {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+
+    const os = await $.process.run(['uname', '-s'])
+    if (os.stdout.trim() !== 'Darwin') {
+      $.ui.toast('dev-tab needs macOS: it scripts the browser with osascript')
+      return started
+    }
 
     const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd: e.cwd })
     const root = top.exitCode === 0 ? top.stdout.trim() : e.cwd
@@ -120,7 +126,7 @@ export const register: Register = on => {
     const query = Object.keys(BROWSERS).map(id => `kMDItemCFBundleIdentifier ==[c] "${id}"`).join(' || ')
     const found = await $.process.run(['mdfind', query])
     const names = found.stdout.split('\n').map(p => p.split('/').pop()?.replace(/\.app$/, ''))
-    await update($, installed, () => Object.keys(BROWSERS).filter(id => names.includes(BROWSERS[id].app)))
+    await update($, installed, () => Object.keys(BROWSERS).filter(id => names.includes(BROWSERS[id]!.app)))
 
     await refreshPorts($, root, worktrees)
     $.clock.every(5000, () => refreshPorts($, root, worktrees))
@@ -136,7 +142,7 @@ export const register: Register = on => {
     const def = BROWSERS[await read($, defaultId)]
     const options = [
       { value: 'default', label: `Default${def ? ` (${def.app})` : ''}` },
-      ...(await read($, installed)).map(id => ({ value: id, label: BROWSERS[id].app })),
+      ...(await read($, installed)).map(id => ({ value: id, label: BROWSERS[id]?.app ?? id })),
     ]
 
     const show = async (port: number) => {
