@@ -1,0 +1,5 @@
+{
+  "name": "dev-tab",
+  "owner": { "name": "Michael Williams" },
+  "plugins": [{ "name": "dev-tab", "source": "./" }]
+}
