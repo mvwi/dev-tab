@@ -1,5 +1,6 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
+import type { Server } from '../types'
 
 type Kind = 'chromium' | 'safari' | 'arc' | 'other'
 
@@ -15,25 +16,37 @@ const BROWSERS: Record<string, { app: string; kind: Kind }> = {
   'org.mozilla.firefox': { app: 'Firefox', kind: 'other' },
 }
 
-const ports = atom({ plugin: 'dev-tab', key: 'ports' } as const, [] as number[])
+const servers = atom({ plugin: 'dev-tab', key: 'servers' } as const, [] as Server[])
 const browser = atom({ plugin: 'dev-tab', key: 'browser' } as const, 'default')
 const installed = atom({ plugin: 'dev-tab', key: 'installed' } as const, [] as string[])
 const defaultId = atom({ plugin: 'dev-tab', key: 'defaultId' } as const, '')
 
-// Ports whose listening process has its cwd in `root` and not in a worktree nested under it.
-export function ownedPorts(listenOut: string, cwdOut: string, worktrees: string[], root: string): number[] {
+// Ports whose listening process has its cwd in `root` and not in a worktree nested under it, with the pid of each.
+export function ownedPorts(listenOut: string, cwdOut: string, worktrees: string[], root: string): Map<number, string> {
   const byPid = parseListeners(listenOut)
   const inside = (dir: string, wt: string) => dir === wt || dir.startsWith(wt + '/')
-  const out = new Set<number>()
+  const out = new Map<number, string>()
   let pid = ''
   for (const line of cwdOut.split('\n')) {
     if (line[0] === 'p') pid = line.slice(1)
     if (line[0] !== 'n') continue
     const dir = line.slice(1)
     const owner = worktrees.filter(wt => inside(dir, wt)).sort((a, b) => b.length - a.length)[0]
-    if (owner === root) byPid.get(pid)?.forEach(p => out.add(p))
+    if (owner === root) byPid.get(pid)?.forEach(p => out.set(p, pid))
   }
-  return [...out].sort((a, b) => a - b)
+  return new Map([...out].sort(([a], [b]) => a - b))
+}
+
+// The tool behind a server's command line: `node /x/node_modules/.bin/vite --port 5173` is `vite`.
+// shortcut: skips a fixed list of interpreters and flags, extend it when a real server shows a wrong name
+const INTERPRETERS = new Set(['node', 'nodejs', 'bun', 'deno', 'tsx', 'ts-node', 'python', 'python3', 'ruby', 'perl', 'sh', 'bash', 'zsh', 'run'])
+export function serverName(command: string): string {
+  for (const arg of command.trim().split(/\s+/)) {
+    if (arg.startsWith('-')) continue
+    const base = arg.split('/').pop() ?? ''
+    if (!INTERPRETERS.has(base.toLowerCase())) return base
+  }
+  return ''
 }
 
 // Claude Code sessions listen on a local port too. The native install runs a binary named
@@ -87,18 +100,46 @@ end tell
 return "none"`
 }
 
+// Per listening port: its server once `/` answered HTML, else how many probes failed.
+// A server still booting gets PROBES chances; a database or websocket port is then left alone.
+const PROBES = 3
+const probed = new Map<number, Server | number>()
+let refreshing = false
+
+async function probe($: EngineInterface, port: number, pid: string): Promise<Server | undefined> {
+  const curl = await $.process.run(['curl', '-s', '-m', '2', '-o', '/dev/null', '-w', '%{content_type}', `http://localhost:${port}/`])
+  if (curl.exitCode !== 0 || !curl.stdout.includes('text/html')) return
+  const ps = await $.process.run(['ps', '-o', 'command=', '-p', pid])
+  return { port, name: serverName(ps.stdout) }
+}
+
 async function refreshPorts($: EngineInterface, root: string, cwd: string) {
-  const listen = await $.process.run(['lsof', '-nP', '-iTCP', '-sTCP:LISTEN', '-Fpcn'])
-  const pids = [...parseListeners(listen.stdout).keys()]
-  // lsof exits 1 when a pid vanished between calls; its output still holds the rest.
-  const cwds = pids.length ? (await $.process.run(['lsof', '-a', '-p', pids.join(','), '-d', 'cwd', '-Fpn'])).stdout : ''
-  // Read each tick so a worktree made mid-session keeps its own servers.
-  const list = await $.process.run(['git', 'worktree', 'list', '--porcelain'], { cwd })
-  const worktrees = list.stdout.split('\n').filter(l => l.startsWith('worktree ')).map(l => l.slice(9))
-  if (!worktrees.includes(root)) worktrees.push(root)
-  const next = ownedPorts(listen.stdout, cwds, worktrees, root)
-  const prev = await read($, ports)
-  if (next.join() !== prev.join()) await update($, ports, () => next)
+  if (refreshing) return
+  refreshing = true
+  try {
+    const listen = await $.process.run(['lsof', '-nP', '-iTCP', '-sTCP:LISTEN', '-Fpcn'])
+    const pids = [...parseListeners(listen.stdout).keys()]
+    // lsof exits 1 when a pid vanished between calls; its output still holds the rest.
+    const cwds = pids.length ? (await $.process.run(['lsof', '-a', '-p', pids.join(','), '-d', 'cwd', '-Fpn'])).stdout : ''
+    // Read each tick so a worktree made mid-session keeps its own servers.
+    const list = await $.process.run(['git', 'worktree', 'list', '--porcelain'], { cwd })
+    const worktrees = list.stdout.split('\n').filter(l => l.startsWith('worktree ')).map(l => l.slice(9))
+    if (!worktrees.includes(root)) worktrees.push(root)
+    const owned = ownedPorts(listen.stdout, cwds, worktrees, root)
+
+    for (const port of probed.keys()) if (!owned.has(port)) probed.delete(port)
+    for (const [port, pid] of owned) {
+      const seen = probed.get(port)
+      if (typeof seen === 'object' || (typeof seen === 'number' && seen >= PROBES)) continue
+      probed.set(port, (await probe($, port, pid)) ?? (typeof seen === 'number' ? seen + 1 : 1))
+    }
+
+    const next = [...probed.values()].filter((v): v is Server => typeof v === 'object').sort((a, b) => a.port - b.port)
+    const prev = await read($, servers)
+    if (JSON.stringify(next) !== JSON.stringify(prev)) await update($, servers, () => next)
+  } finally {
+    refreshing = false
+  }
 }
 
 // Which of BROWSERS is installed, and which one handles https links.
@@ -126,10 +167,7 @@ export const register: Register = on => {
     const started = await next(e)
 
     const os = await $.process.run(['uname', '-s'])
-    if (os.stdout.trim() !== 'Darwin') {
-      $.ui.toast('dev-tab needs macOS: it scripts the browser with osascript')
-      return started
-    }
+    if (os.stdout.trim() !== 'Darwin') return started
 
     const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd: e.cwd })
     const root = top.exitCode === 0 ? top.stdout.trim() : e.cwd
@@ -146,7 +184,7 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const live = await read($, ports)
+    const live = await read($, servers)
     if (e.props.hasSurvey || live.length === 0) return next(e)
 
     const choice = await read($, browser)
@@ -162,7 +200,12 @@ export const register: Register = on => {
       const url = `http://localhost:${port}`
       if (target && target.kind !== 'other') {
         const res = await $.process.run(['osascript', '-e', focusScript(target.app, target.kind, port)])
-        if (res.exitCode !== 0) $.ui.toast(`Couldn't script ${target.app}: ${res.stderr.trim()}`)
+        if (res.exitCode !== 0) {
+          // -1743: macOS Automation permission denied for this terminal.
+          $.ui.toast(res.stderr.includes('-1743')
+            ? `Allow your terminal to control ${target.app}: System Settings > Privacy & Security > Automation`
+            : `Couldn't script ${target.app}: ${res.stderr.trim()}`)
+        }
         if (res.stdout.trim() === 'found') return
       }
       await $.process.run(target ? ['open', '-a', target.app, url] : ['open', url])
@@ -173,8 +216,8 @@ export const register: Register = on => {
     return (
       <Box>
         <Text dimColor>dev server </Text>
-        {live.map(port => (
-          <Button key={`port-${port}`} label={`:${port}`} onPress={() => void show(port)} />
+        {live.map(({ port, name }) => (
+          <Button key={`port-${port}`} label={`${name ? name + ' ' : ''}:${port}`} onPress={() => void show(port)} />
         ))}
         {Select && (
           <Select
